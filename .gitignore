@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+# Generated data and training artifacts
+datasets/
+runs/
+outputs/
+
+# Local logs and caches
+.codex_*.log
+*.cache
+
+# Downloaded base checkpoint; the fine-tuned demo checkpoint lives in models/flood_seg/.
+yolo11n-seg.pt
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
