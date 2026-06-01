@@ -114,6 +114,8 @@ models\flood_seg\best.pt
 
 검증용 결과:
 
+![Water edge preview](docs/images/water_edge_surface_hybrid_preview.jpg)
+
 ```text
 outputs\water_edge_yolo11_full_demo.mp4
 outputs\water_edge_yolo11_full_demo_frame40.jpg
