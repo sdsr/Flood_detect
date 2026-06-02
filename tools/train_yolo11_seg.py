@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train a YOLO11 segmentation model for water edges.")
+    parser = argparse.ArgumentParser(description="Train a YOLO segmentation model for water edges.")
     parser.add_argument("--data", default="datasets/water_seg/data.yaml")
-    parser.add_argument("--model", default="yolo11n-seg.pt", help="Pretrained YOLO11 segmentation checkpoint")
+    parser.add_argument("--model", default="yolo11n-seg.pt", help="Pretrained YOLO segmentation checkpoint")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--imgsz", type=int, default=960)
     parser.add_argument("--batch", type=int, default=4)
@@ -45,7 +45,7 @@ def main() -> int:
     if not best:
         best = Path(args.project) / args.name / "weights" / "best.pt"
     print(f"best model: {best.resolve()}")
-    print("copy it to: models/flood_seg/best.pt")
+    print("copy it to a model path under: models/flood_seg/")
     return 0
 
 

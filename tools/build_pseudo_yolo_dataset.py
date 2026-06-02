@@ -17,7 +17,9 @@ from src.water_edge_segmenter import (  # noqa: E402
     WaterEdgeSegmenter,
     contours_from_mask,
     parse_bgr,
+    parse_polygons,
     parse_roi,
+    surface_preset_polygons,
 )
 
 
@@ -34,9 +36,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument(
+        "--frame-scale",
+        type=float,
+        default=1.0,
+        help="Resize frames before pseudo-labeling and saving the training image.",
+    )
 
     parser.add_argument("--roi", default=None, help="Normalized ROI as x0,y0,x1,y1. Omit for full-frame labels.")
     parser.add_argument("--min-area", type=int, default=6500)
+    parser.add_argument(
+        "--max-component-aspect",
+        type=float,
+        default=0.0,
+        help="Drop long, thin mask components with a bounding-box aspect ratio above this value; 0 disables.",
+    )
     parser.add_argument("--morph-kernel", type=int, default=15)
     parser.add_argument("--border-margin", type=int, default=8)
     parser.add_argument("--sat-max", type=int, default=92)
@@ -51,6 +65,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muddy-value-min", type=int, default=50)
     parser.add_argument("--muddy-value-max", type=int, default=225)
     parser.add_argument("--muddy-texture-std-max", type=float, default=36)
+    parser.add_argument("--muddy-loose", action="store_true")
+    parser.add_argument(
+        "--surface-preset",
+        default="none",
+        choices=("none", "yeongildae", "yeongildae-road"),
+        help="Valid-surface mask for fixed CCTV samples.",
+    )
+    parser.add_argument(
+        "--surface-polygon",
+        default=None,
+        help="Normalized polygon points, e.g. '0,0.4 1,0.2 1,1 0,1'. Use ';' for multiple polygons.",
+    )
     parser.add_argument("--water-color", default="255,255,0")
     parser.add_argument("--muddy-color", default="0,170,255")
     return parser
@@ -78,6 +104,7 @@ def main() -> int:
             water_color=parse_bgr(args.water_color),
             muddy_color=parse_bgr(args.muddy_color),
             min_area=args.min_area,
+            max_component_aspect=max(0.0, args.max_component_aspect),
             morph_kernel=args.morph_kernel,
             border_margin=args.border_margin,
             sat_max=args.sat_max,
@@ -92,6 +119,11 @@ def main() -> int:
             muddy_value_min=args.muddy_value_min,
             muddy_value_max=args.muddy_value_max,
             muddy_texture_std_max=args.muddy_texture_std_max,
+            muddy_loose=args.muddy_loose,
+            surface_polygons=merge_polygons(
+                surface_preset_polygons(args.surface_preset),
+                parse_polygons(args.surface_polygon),
+            ),
         )
     )
 
@@ -104,6 +136,7 @@ def main() -> int:
             break
         if args.end_ms > 0 and pos_ms > args.end_ms:
             break
+        frame = resize_frame(frame, args.frame_scale)
 
         masks = segmenter.segment_layers(frame)
         label_lines = []
@@ -180,6 +213,23 @@ def mask_to_yolo_lines(mask, class_id: int, min_area: int) -> list[str]:
 
 def parse_source(value: str):
     return int(value) if value.isdigit() else value
+
+
+def merge_polygons(*items):
+    merged = []
+    for item in items:
+        if item:
+            merged.extend(item)
+    return tuple(merged) or None
+
+
+def resize_frame(frame, scale: float):
+    scale = max(0.1, min(1.0, float(scale)))
+    if scale >= 0.999:
+        return frame
+    width = max(1, int(round(frame.shape[1] * scale)))
+    height = max(1, int(round(frame.shape[0] * scale)))
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
 
 
 def read_seek_frame(cap: cv2.VideoCapture, start_ms: float):

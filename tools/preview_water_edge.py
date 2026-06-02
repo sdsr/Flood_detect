@@ -29,10 +29,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default=None, help="Optional MP4 path to write the overlaid demo")
     parser.add_argument(
         "--backend",
-        choices=("heuristic", "yolo", "yolo11", "roboflow", "river"),
+        choices=("heuristic", "yolo", "yolo11", "yolo26", "roboflow", "river"),
         default="heuristic",
     )
-    parser.add_argument("--seg-model", default=None, help="YOLO/YOLO11 segmentation .pt path")
+    parser.add_argument("--seg-model", default=None, help="YOLO/YOLO11/YOLO26 segmentation .pt path")
     parser.add_argument("--roi", default=None, help="Normalized ROI as x0,y0,x1,y1")
     parser.add_argument("--no-window", action="store_true", help="Render without opening cv2.imshow")
     parser.add_argument("--start-ms", type=float, default=0.0, help="Seek to this timestamp before reading")
@@ -48,14 +48,51 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pause", action="store_true", help="Start preview paused")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames; 0 means full video")
     parser.add_argument("--frame-stride", type=int, default=1, help="Process every Nth frame")
+    parser.add_argument(
+        "--frame-scale",
+        type=float,
+        default=1.0,
+        help="Resize the source frame before segmentation, display, and optional output.",
+    )
     parser.add_argument("--display-scale", type=float, default=1.0, help="Preview window scale")
     parser.add_argument("--line-color", default=None, help="Deprecated alias for --water-color")
     parser.add_argument("--water-color", default="255,255,0", help="BGR color for regular/reflective water")
     parser.add_argument("--muddy-color", default="0,170,255", help="BGR color for muddy/brown water")
     parser.add_argument("--line-thickness", type=int, default=3)
     parser.add_argument("--mask-alpha", type=float, default=0.16)
+    parser.add_argument(
+        "--edge-mode",
+        choices=("layers", "combined"),
+        default="layers",
+        help="Draw separate regular/muddy edges or one combined water outline.",
+    )
+    parser.add_argument("--edge-color", default=None, help="BGR color for --edge-mode combined")
+    parser.add_argument(
+        "--edge-smooth-ratio",
+        type=float,
+        default=0.0025,
+        help="Contour simplification ratio. Higher values draw smoother, less jagged outlines.",
+    )
+    parser.add_argument(
+        "--edge-bridge-pixels",
+        type=int,
+        default=0,
+        help="Close small mask gaps before drawing edge lines, without changing the model output.",
+    )
+    parser.add_argument(
+        "--process-scale",
+        type=float,
+        default=1.0,
+        help="Run segmentation on a downscaled frame, then draw the mask on the original frame.",
+    )
     parser.add_argument("--show-roi-border-edges", action="store_true")
     parser.add_argument("--min-area", type=int, default=900)
+    parser.add_argument(
+        "--max-component-aspect",
+        type=float,
+        default=0.0,
+        help="Drop long, thin mask components with a bounding-box aspect ratio above this value; 0 disables.",
+    )
     parser.add_argument("--morph-kernel", type=int, default=9)
     parser.add_argument("--border-margin", type=int, default=8)
     parser.add_argument("--sat-max", type=int, default=95)
@@ -71,6 +108,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--muddy-value-min", type=int, default=55)
     parser.add_argument("--muddy-value-max", type=int, default=225)
     parser.add_argument("--muddy-texture-std-max", type=float, default=34.0)
+    parser.add_argument(
+        "--muddy-loose",
+        action="store_true",
+        help="Add wider HSV/Lab muddy-water candidates for pale or reflective brown water.",
+    )
+    parser.add_argument(
+        "--muddy-expand-pixels",
+        type=int,
+        default=0,
+        help="Grow muddy candidates inside the Roboflow flood mask by this many pixels.",
+    )
     parser.add_argument("--yolo-conf", type=float, default=0.35)
     parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument("--yolo-device", default="cpu")
@@ -87,8 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--surface-preset",
         default="none",
-        choices=("none", "yeongildae"),
-        help="Broad valid-surface mask. Use yeongildae for the bundled CCTV sample.",
+        choices=("none", "yeongildae", "yeongildae-road"),
+        help="Valid-surface mask. Use yeongildae-road when storefront/building areas are included.",
     )
     parser.add_argument(
         "--surface-polygon",
@@ -100,6 +148,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--roboflow-endpoint", default="river-flood-detection/5")
     parser.add_argument("--roboflow-api-url", default="https://serverless.roboflow.com")
     parser.add_argument("--roboflow-confidence", type=float, default=0.25)
+    parser.add_argument("--roboflow-overlap", type=int, default=30)
+    parser.add_argument(
+        "--roboflow-mask-mode",
+        choices=("all", "muddy-priority", "muddy-only"),
+        default="all",
+        help="Post-filter Roboflow masks with the muddy-water heuristic.",
+    )
     return parser
 
 
@@ -122,8 +177,14 @@ def main() -> int:
             muddy_color=parse_bgr(args.muddy_color),
             line_thickness=args.line_thickness,
             mask_alpha=max(0.0, min(1.0, args.mask_alpha)),
+            edge_mode=args.edge_mode,
+            edge_color=parse_bgr(args.edge_color) if args.edge_color else None,
+            edge_smooth_ratio=max(0.0, args.edge_smooth_ratio),
+            edge_bridge_pixels=max(0, args.edge_bridge_pixels),
+            process_scale=max(0.1, min(1.0, args.process_scale)),
             suppress_roi_border_edges=not args.show_roi_border_edges,
             min_area=args.min_area,
+            max_component_aspect=max(0.0, args.max_component_aspect),
             morph_kernel=args.morph_kernel,
             border_margin=args.border_margin,
             sat_max=args.sat_max,
@@ -139,6 +200,8 @@ def main() -> int:
             muddy_value_min=args.muddy_value_min,
             muddy_value_max=args.muddy_value_max,
             muddy_texture_std_max=args.muddy_texture_std_max,
+            muddy_loose=args.muddy_loose,
+            muddy_expand_pixels=max(0, args.muddy_expand_pixels),
             yolo_conf=args.yolo_conf,
             yolo_imgsz=args.yolo_imgsz,
             yolo_device=args.yolo_device,
@@ -150,6 +213,8 @@ def main() -> int:
             roboflow_endpoint=args.roboflow_endpoint,
             roboflow_api_url=args.roboflow_api_url,
             roboflow_confidence=args.roboflow_confidence,
+            roboflow_overlap=args.roboflow_overlap,
+            roboflow_mask_mode=args.roboflow_mask_mode,
         )
         segmenter = WaterEdgeSegmenter(config, model_path=args.seg_model)
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
@@ -165,8 +230,13 @@ def main() -> int:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    frame_scale = max(0.1, min(1.0, args.frame_scale))
+    output_width = max(1, int(round(width * frame_scale)))
+    output_height = max(1, int(round(height * frame_scale)))
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     print(f"source opened: {width}x{height}, fps={fps:.2f}, frames={total}")
+    if frame_scale < 0.999:
+        print(f"frame scale: {frame_scale:.2f} -> {output_width}x{output_height}")
     if args.start_ms > 0:
         cap.set(cv2.CAP_PROP_POS_MSEC, args.start_ms)
         print(f"seek: start_ms={args.start_ms:.0f}")
@@ -177,7 +247,12 @@ def main() -> int:
         output_path = Path(args.output)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, fps / max(1, args.frame_stride), (width, height))
+        writer = cv2.VideoWriter(
+            str(output_path),
+            fourcc,
+            fps / max(1, args.frame_stride),
+            (output_width, output_height),
+        )
         if not writer.isOpened():
             print(f"ERROR: failed to open output writer: {output_path}", file=sys.stderr)
             return 3
@@ -247,6 +322,8 @@ def main() -> int:
             read_count += 1
             if not from_pending and args.frame_stride > 1 and (read_count - 1) % args.frame_stride != 0:
                 continue
+            if frame_scale < 0.999:
+                frame = resize_for_display(frame, frame_scale)
 
             output, _mask, contours = segmenter.draw(frame)
             processed += 1

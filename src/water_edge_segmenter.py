@@ -24,8 +24,14 @@ class EdgeConfig:
     muddy_color: ColorBGR = (0, 170, 255)
     line_thickness: int = 3
     mask_alpha: float = 0.16
+    edge_mode: str = "layers"
+    edge_color: Optional[ColorBGR] = None
+    edge_smooth_ratio: float = 0.0025
+    edge_bridge_pixels: int = 0
+    process_scale: float = 1.0
     suppress_roi_border_edges: bool = True
     min_area: int = 800
+    max_component_aspect: float = 0.0
     morph_kernel: int = 9
     border_margin: int = 6
     sat_max: int = 95
@@ -41,6 +47,8 @@ class EdgeConfig:
     muddy_value_min: int = 55
     muddy_value_max: int = 225
     muddy_texture_std_max: float = 34.0
+    muddy_loose: bool = False
+    muddy_expand_pixels: int = 0
     yolo_conf: float = 0.35
     yolo_imgsz: int = 640
     yolo_device: str = "cpu"
@@ -52,6 +60,8 @@ class EdgeConfig:
     roboflow_endpoint: str = "river-flood-detection/5"
     roboflow_api_url: str = "https://serverless.roboflow.com"
     roboflow_confidence: float = 0.25
+    roboflow_overlap: int = 30
+    roboflow_mask_mode: str = "all"
 
 
 @dataclass(frozen=True)
@@ -72,13 +82,21 @@ class WaterEdgeSegmenter:
         self._surface_mask_shape: Optional[tuple[int, int]] = None
         self._surface_mask: Optional[np.ndarray] = None
         backend = config.backend.lower().strip()
-        if backend == "yolo11":
+        if backend in {"yolo11", "yolo26"}:
             backend = "yolo"
         if backend == "river":
             backend = "roboflow"
         if backend not in {"heuristic", "yolo", "roboflow"}:
-            raise ValueError("backend must be 'heuristic', 'yolo', 'yolo11', 'roboflow', or 'river'")
+            raise ValueError(
+                "backend must be 'heuristic', 'yolo', 'yolo11', 'yolo26', 'roboflow', or 'river'"
+            )
         self.backend = backend
+        self.edge_mode = config.edge_mode.lower().strip()
+        if self.edge_mode not in {"layers", "combined"}:
+            raise ValueError("--edge-mode must be 'layers' or 'combined'")
+        self.roboflow_mask_mode = config.roboflow_mask_mode.lower().strip()
+        if self.roboflow_mask_mode not in {"all", "muddy-priority", "muddy-only"}:
+            raise ValueError("--roboflow-mask-mode must be 'all', 'muddy-priority', or 'muddy-only'")
         if self.backend == "yolo":
             if not model_path:
                 raise ValueError("--seg-model is required when --backend yolo is used")
@@ -112,38 +130,64 @@ class WaterEdgeSegmenter:
         if roi_frame.size == 0:
             empty = np.zeros(frame.shape[:2], dtype=np.uint8)
             return SegmentationMasks(regular=empty, muddy=empty)
+        segment_frame = resize_for_processing(roi_frame, self.config.process_scale)
 
         if self.backend == "yolo":
-            regular_roi, muddy_roi = self._segment_yolo(roi_frame)
+            regular_roi, muddy_roi = self._segment_yolo(segment_frame)
             if self.config.hybrid_muddy:
-                _, heuristic_muddy = self._segment_heuristic(roi_frame)
+                _, heuristic_muddy = self._segment_heuristic(segment_frame)
                 muddy_roi = cv2.bitwise_or(muddy_roi, heuristic_muddy)
         elif self.backend == "roboflow":
-            regular_roi, muddy_roi = self._segment_roboflow(roi_frame)
+            regular_roi, muddy_roi = self._segment_roboflow(segment_frame)
         else:
-            regular_roi, muddy_roi = self._segment_heuristic(roi_frame)
+            regular_roi, muddy_roi = self._segment_heuristic(segment_frame)
+
+        process_ratio = regular_roi.shape[1] / max(1, roi_frame.shape[1])
 
         surface_mask = self._surface_mask_for_shape(frame.shape)
         if surface_mask is not None:
             surface_roi_mask = surface_mask[y0:y1, x0:x1]
+            if surface_roi_mask.shape[:2] != regular_roi.shape[:2]:
+                surface_roi_mask = cv2.resize(
+                    surface_roi_mask,
+                    (regular_roi.shape[1], regular_roi.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
             regular_roi = cv2.bitwise_and(regular_roi, surface_roi_mask)
             muddy_roi = cv2.bitwise_and(muddy_roi, surface_roi_mask)
 
+        min_area = max(1, int(round(self.config.min_area * process_ratio * process_ratio)))
+        kernel_size = max(1, int(round(self.config.morph_kernel * process_ratio)))
+        border_margin = max(0, int(round(self.config.border_margin * process_ratio)))
         regular_roi = postprocess_mask(
             regular_roi,
-            min_area=self.config.min_area,
-            kernel_size=self.config.morph_kernel,
-            border_margin=self.config.border_margin,
+            min_area=min_area,
+            kernel_size=kernel_size,
+            border_margin=border_margin,
+            max_component_aspect=self.config.max_component_aspect,
         )
         muddy_roi = postprocess_mask(
             muddy_roi,
-            min_area=self.config.min_area,
-            kernel_size=self.config.morph_kernel,
-            border_margin=self.config.border_margin,
+            min_area=min_area,
+            kernel_size=kernel_size,
+            border_margin=border_margin,
+            max_component_aspect=self.config.max_component_aspect,
         )
         # Muddy water gets priority where the two rules overlap, so the overlay
         # stays visually meaningful instead of collapsing back into one color.
         regular_roi[muddy_roi > 0] = 0
+
+        if regular_roi.shape[:2] != roi_frame.shape[:2]:
+            regular_roi = cv2.resize(
+                regular_roi,
+                (roi_frame.shape[1], roi_frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            muddy_roi = cv2.resize(
+                muddy_roi,
+                (roi_frame.shape[1], roi_frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
 
         regular = np.zeros(frame.shape[:2], dtype=np.uint8)
         muddy = np.zeros(frame.shape[:2], dtype=np.uint8)
@@ -157,7 +201,8 @@ class WaterEdgeSegmenter:
     def draw(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
         masks = self.segment_layers(frame)
         mask = masks.combined
-        contours = contours_from_mask(mask, self.config.min_area)
+        edge_mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
+        contours = contours_from_mask(edge_mask, self.config.min_area, self.config.edge_smooth_ratio)
         output = frame.copy()
         if self.config.mask_alpha > 0:
             overlay = output.copy()
@@ -172,8 +217,16 @@ class WaterEdgeSegmenter:
                 0.55,
             )
             output = cv2.addWeighted(overlay, self.config.mask_alpha, output, 1 - self.config.mask_alpha, 0)
-        self._draw_layer_edges(output, frame.shape[:2], masks.regular, self.config.water_color)
-        self._draw_layer_edges(output, frame.shape[:2], masks.muddy, self.config.muddy_color)
+        if self.edge_mode == "combined":
+            self._draw_layer_edges(
+                output,
+                frame.shape[:2],
+                edge_mask,
+                self.config.edge_color or self.config.muddy_color,
+            )
+        else:
+            self._draw_layer_edges(output, frame.shape[:2], masks.regular, self.config.water_color)
+            self._draw_layer_edges(output, frame.shape[:2], masks.muddy, self.config.muddy_color)
         return output, mask, contours
 
     def _draw_layer_edges(
@@ -183,7 +236,8 @@ class WaterEdgeSegmenter:
         mask: np.ndarray,
         color: ColorBGR,
     ) -> None:
-        contours = contours_from_mask(mask, self.config.min_area)
+        mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
+        contours = contours_from_mask(mask, self.config.min_area, self.config.edge_smooth_ratio)
         if not contours:
             return
         should_suppress_surface = (
@@ -303,15 +357,31 @@ class WaterEdgeSegmenter:
         payload = base64.b64encode(encoded.tobytes()).decode("ascii")
         endpoint = self.config.roboflow_endpoint.strip("/")
         url = f"{self.config.roboflow_api_url.rstrip('/')}/{endpoint}"
+        api_confidence = int(np.clip(self.config.roboflow_confidence, 0.0, 1.0) * 100)
         response = requests.post(
             url,
-            params={"api_key": self.config.roboflow_api_key or os.getenv("ROBOFLOW_API_KEY")},
+            params={
+                "api_key": self.config.roboflow_api_key or os.getenv("ROBOFLOW_API_KEY"),
+                "confidence": api_confidence,
+                "overlap": int(np.clip(self.config.roboflow_overlap, 0, 100)),
+            },
             data=payload,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
         response.raise_for_status()
-        for pred in response.json().get("predictions", []):
+        response_data = response.json()
+        predictions = response_data.get("predictions", [])
+        if isinstance(predictions, dict) and predictions.get("segmentation_mask"):
+            decoded_mask = decode_semantic_segmentation_mask(
+                predictions["segmentation_mask"],
+                size=(roi_frame.shape[1], roi_frame.shape[0]),
+            )
+            regular[decoded_mask > 0] = 255
+            return self._apply_roboflow_mask_mode(roi_frame, regular, muddy)
+        if not isinstance(predictions, list):
+            return self._apply_roboflow_mask_mode(roi_frame, regular, muddy)
+        for pred in predictions:
             confidence = float(pred.get("confidence", 0.0) or 0.0)
             if confidence < self.config.roboflow_confidence:
                 continue
@@ -325,7 +395,78 @@ class WaterEdgeSegmenter:
             cls_name = str(pred.get("class", "")).lower()
             target = muddy if cls_name in {"muddy", "muddy_water", "brown_water"} else regular
             cv2.fillPoly(target, [polygon], 255)
-        return regular, muddy
+        return self._apply_roboflow_mask_mode(roi_frame, regular, muddy)
+
+    def _apply_roboflow_mask_mode(
+        self,
+        roi_frame: np.ndarray,
+        regular: np.ndarray,
+        muddy: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if self.roboflow_mask_mode == "all":
+            return regular, muddy
+
+        _, heuristic_muddy = self._segment_heuristic(roi_frame)
+        if self.config.muddy_loose:
+            heuristic_muddy = cv2.bitwise_or(heuristic_muddy, self._segment_loose_muddy(roi_frame))
+        roboflow_mask = cv2.bitwise_or(regular, muddy)
+        muddy_candidate = cv2.bitwise_and(roboflow_mask, heuristic_muddy)
+        if self.config.muddy_expand_pixels > 0:
+            muddy_candidate = expand_mask_within(
+                muddy_candidate,
+                roboflow_mask,
+                self.config.muddy_expand_pixels,
+            )
+        if self.roboflow_mask_mode == "muddy-only":
+            regular = np.zeros_like(regular)
+        else:
+            regular = cv2.bitwise_and(roboflow_mask, cv2.bitwise_not(muddy_candidate))
+        return regular, muddy_candidate
+
+    def _segment_loose_muddy(self, roi_frame: np.ndarray) -> np.ndarray:
+        blurred = cv2.bilateralFilter(roi_frame, 7, 45, 45)
+        hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+        lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+        gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+
+        hue = hsv[:, :, 0]
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+        lab_a = lab[:, :, 1]
+        lab_b = lab[:, :, 2]
+
+        gray_f = gray.astype(np.float32)
+        mean = cv2.blur(gray_f, (13, 13))
+        mean_sq = cv2.blur(gray_f * gray_f, (13, 13))
+        local_std = np.sqrt(np.maximum(mean_sq - mean * mean, 0))
+
+        hue_min = max(0, self.config.muddy_hue_min - 8)
+        hue_max = min(85, self.config.muddy_hue_max + 15)
+        sat_min = max(5, self.config.muddy_sat_min // 2)
+        sat_max = min(240, self.config.muddy_sat_max + 45)
+        value_min = max(25, self.config.muddy_value_min - 20)
+        value_max = min(245, self.config.muddy_value_max + 20)
+        texture_max = max(self.config.muddy_texture_std_max + 22, self.config.texture_std_max + 18)
+
+        loose_hsv = (
+            (hue >= hue_min)
+            & (hue <= hue_max)
+            & (saturation >= sat_min)
+            & (saturation <= sat_max)
+            & (value >= value_min)
+            & (value <= value_max)
+            & (local_std <= texture_max)
+        )
+        warm_lab = (
+            (lab_b >= 124)
+            & (lab_a >= 106)
+            & (lab_a <= 158)
+            & (saturation >= 8)
+            & (value >= value_min)
+            & (value <= value_max)
+            & (local_std <= texture_max)
+        )
+        return (loose_hsv | warm_lab).astype(np.uint8) * 255
 
     def _surface_mask_for_shape(self, shape: tuple[int, ...]) -> Optional[np.ndarray]:
         if not self.config.surface_polygons:
@@ -368,7 +509,13 @@ def roi_to_pixels(shape: tuple[int, ...], roi: Optional[Roi]) -> tuple[int, int,
     return x0_i, y0_i, x1_i, y1_i
 
 
-def postprocess_mask(mask: np.ndarray, min_area: int, kernel_size: int, border_margin: int) -> np.ndarray:
+def postprocess_mask(
+    mask: np.ndarray,
+    min_area: int,
+    kernel_size: int,
+    border_margin: int,
+    max_component_aspect: float = 0.0,
+) -> np.ndarray:
     if mask.dtype != np.uint8:
         mask = mask.astype(np.uint8)
     _, mask = cv2.threshold(mask, 127, 255, cv2.THRESH_BINARY)
@@ -383,25 +530,41 @@ def postprocess_mask(mask: np.ndarray, min_area: int, kernel_size: int, border_m
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return filter_small_components(mask, min_area)
+    return filter_small_components(mask, min_area, max_component_aspect=max_component_aspect)
 
 
-def filter_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
+def resize_for_processing(frame: np.ndarray, scale: float) -> np.ndarray:
+    if scale >= 0.999:
+        return frame
+    scale = float(np.clip(scale, 0.1, 1.0))
+    width = max(1, int(round(frame.shape[1] * scale)))
+    height = max(1, int(round(frame.shape[0] * scale)))
+    return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def filter_small_components(mask: np.ndarray, min_area: int, max_component_aspect: float = 0.0) -> np.ndarray:
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     filtered = np.zeros_like(mask)
     for label in range(1, num_labels):
-        if stats[label, cv2.CC_STAT_AREA] >= min_area:
-            filtered[labels == label] = 255
+        if stats[label, cv2.CC_STAT_AREA] < min_area:
+            continue
+        if max_component_aspect > 0:
+            width = max(1, int(stats[label, cv2.CC_STAT_WIDTH]))
+            height = max(1, int(stats[label, cv2.CC_STAT_HEIGHT]))
+            aspect = max(width / height, height / width)
+            if aspect > max_component_aspect:
+                continue
+        filtered[labels == label] = 255
     return filtered
 
 
-def contours_from_mask(mask: np.ndarray, min_area: int) -> list[np.ndarray]:
+def contours_from_mask(mask: np.ndarray, min_area: int, epsilon_ratio: float = 0.0025) -> list[np.ndarray]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     kept: list[np.ndarray] = []
     for contour in contours:
         if cv2.contourArea(contour) < min_area:
             continue
-        epsilon = max(1.0, 0.0025 * cv2.arcLength(contour, True))
+        epsilon = max(1.0, max(0.0, epsilon_ratio) * cv2.arcLength(contour, True))
         kept.append(cv2.approxPolyDP(contour, epsilon, True))
     return kept
 
@@ -423,12 +586,47 @@ def edge_mask_from_contours(
     return edge_mask
 
 
+def bridge_mask_gaps(mask: np.ndarray, pixels: int) -> np.ndarray:
+    if pixels <= 0:
+        return mask
+    kernel_size = max(3, int(pixels) * 2 + 1)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+
+def expand_mask_within(seed: np.ndarray, constraint: np.ndarray, pixels: int) -> np.ndarray:
+    result = cv2.bitwise_and(seed, constraint)
+    if pixels <= 0:
+        return result
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    iterations = max(1, int(round(pixels / 2)))
+    for _ in range(iterations):
+        result = cv2.dilate(result, kernel)
+        result = cv2.bitwise_and(result, constraint)
+    return result
+
+
 def surface_border_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     kernel_size = max(3, margin * 2 + 1)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     inner = cv2.erode(mask, kernel)
     outer = cv2.dilate(mask, kernel)
     return cv2.subtract(outer, inner)
+
+
+def decode_semantic_segmentation_mask(mask_base64: str, size: tuple[int, int]) -> np.ndarray:
+    raw = base64.b64decode(mask_base64)
+    encoded = np.frombuffer(raw, dtype=np.uint8)
+    mask = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
+    if mask is None:
+        return np.zeros((size[1], size[0]), dtype=np.uint8)
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask[:, :, :3], cv2.COLOR_BGR2GRAY)
+    if mask.shape[:2] != (size[1], size[0]):
+        mask = cv2.resize(mask, size, interpolation=cv2.INTER_NEAREST)
+    return (mask > 0).astype(np.uint8) * 255
 
 
 def blend_color(pixels: np.ndarray, color: ColorBGR, alpha: float) -> np.ndarray:
@@ -479,8 +677,26 @@ def surface_preset_polygons(name: Optional[str]) -> Optional[tuple[Polygon, ...]
     if name is None or name.strip().lower() in {"", "none"}:
         return None
     normalized = name.strip().lower()
-    if normalized != "yeongildae":
-        raise ValueError("surface preset must be 'none' or 'yeongildae'")
+    if normalized not in {"yeongildae", "yeongildae-road"}:
+        raise ValueError("surface preset must be 'none', 'yeongildae', or 'yeongildae-road'")
+    if normalized == "yeongildae-road":
+        return (
+            (
+                (0.00, 0.49),
+                (0.11, 0.49),
+                (0.19, 0.45),
+                (0.31, 0.44),
+                (0.42, 0.44),
+                (0.50, 0.43),
+                (0.56, 0.39),
+                (0.60, 0.31),
+                (0.66, 0.24),
+                (0.77, 0.20),
+                (1.00, 0.16),
+                (1.00, 1.00),
+                (0.00, 1.00),
+            ),
+        )
     return (
         (
             (0.00, 0.40),
