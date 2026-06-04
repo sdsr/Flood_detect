@@ -74,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Contour simplification ratio. Higher values draw smoother, less jagged outlines.",
     )
     parser.add_argument(
+        "--edge-curve-iterations",
+        type=int,
+        default=0,
+        help="Round contour corners while keeping more boundary points. Try 1-2 for smoother live edges.",
+    )
+    parser.add_argument(
         "--edge-bridge-pixels",
         type=int,
         default=0,
@@ -180,6 +186,7 @@ def main() -> int:
             edge_mode=args.edge_mode,
             edge_color=parse_bgr(args.edge_color) if args.edge_color else None,
             edge_smooth_ratio=max(0.0, args.edge_smooth_ratio),
+            edge_curve_iterations=max(0, args.edge_curve_iterations),
             edge_bridge_pixels=max(0, args.edge_bridge_pixels),
             process_scale=max(0.1, min(1.0, args.process_scale)),
             suppress_roi_border_edges=not args.show_roi_border_edges,
@@ -325,7 +332,11 @@ def main() -> int:
             if frame_scale < 0.999:
                 frame = resize_for_display(frame, frame_scale)
 
-            output, _mask, contours = segmenter.draw(frame)
+            try:
+                output, _mask, contours = segmenter.draw(frame)
+            except RuntimeError as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 5
             processed += 1
             draw_hud(output, processed, len(contours), args.backend, current_ms, paused)
             if not args.no_window:

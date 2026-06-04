@@ -1,0 +1,3 @@
+transformers
+safetensors
+huggingface_hub

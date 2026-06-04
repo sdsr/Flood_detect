@@ -27,6 +27,7 @@ class EdgeConfig:
     edge_mode: str = "layers"
     edge_color: Optional[ColorBGR] = None
     edge_smooth_ratio: float = 0.0025
+    edge_curve_iterations: int = 0
     edge_bridge_pixels: int = 0
     process_scale: float = 1.0
     suppress_roi_border_edges: bool = True
@@ -135,12 +136,12 @@ class WaterEdgeSegmenter:
         if self.backend == "yolo":
             regular_roi, muddy_roi = self._segment_yolo(segment_frame)
             if self.config.hybrid_muddy:
-                _, heuristic_muddy = self._segment_heuristic(segment_frame)
+                _, heuristic_muddy = self._segment_heuristic_layers(segment_frame)
                 muddy_roi = cv2.bitwise_or(muddy_roi, heuristic_muddy)
         elif self.backend == "roboflow":
             regular_roi, muddy_roi = self._segment_roboflow(segment_frame)
         else:
-            regular_roi, muddy_roi = self._segment_heuristic(segment_frame)
+            regular_roi, muddy_roi = self._segment_heuristic_layers(segment_frame)
 
         process_ratio = regular_roi.shape[1] / max(1, roi_frame.shape[1])
 
@@ -202,7 +203,12 @@ class WaterEdgeSegmenter:
         masks = self.segment_layers(frame)
         mask = masks.combined
         edge_mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
-        contours = contours_from_mask(edge_mask, self.config.min_area, self.config.edge_smooth_ratio)
+        contours = contours_from_mask(
+            edge_mask,
+            self.config.min_area,
+            self.config.edge_smooth_ratio,
+            self.config.edge_curve_iterations,
+        )
         output = frame.copy()
         if self.config.mask_alpha > 0:
             overlay = output.copy()
@@ -237,7 +243,12 @@ class WaterEdgeSegmenter:
         color: ColorBGR,
     ) -> None:
         mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
-        contours = contours_from_mask(mask, self.config.min_area, self.config.edge_smooth_ratio)
+        contours = contours_from_mask(
+            mask,
+            self.config.min_area,
+            self.config.edge_smooth_ratio,
+            self.config.edge_curve_iterations,
+        )
         if not contours:
             return
         should_suppress_surface = (
@@ -309,6 +320,12 @@ class WaterEdgeSegmenter:
 
         return reflective_water.astype(np.uint8) * 255, muddy_water.astype(np.uint8) * 255
 
+    def _segment_heuristic_layers(self, roi_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        regular, muddy = self._segment_heuristic(roi_frame)
+        if self.config.muddy_loose:
+            muddy = cv2.bitwise_or(muddy, self._segment_loose_muddy(roi_frame))
+        return regular, muddy
+
     def _segment_yolo(self, roi_frame: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         assert self.model is not None
         results = self.model.predict(
@@ -358,19 +375,31 @@ class WaterEdgeSegmenter:
         endpoint = self.config.roboflow_endpoint.strip("/")
         url = f"{self.config.roboflow_api_url.rstrip('/')}/{endpoint}"
         api_confidence = int(np.clip(self.config.roboflow_confidence, 0.0, 1.0) * 100)
-        response = requests.post(
-            url,
-            params={
-                "api_key": self.config.roboflow_api_key or os.getenv("ROBOFLOW_API_KEY"),
-                "confidence": api_confidence,
-                "overlap": int(np.clip(self.config.roboflow_overlap, 0, 100)),
-            },
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=20,
-        )
-        response.raise_for_status()
-        response_data = response.json()
+        params = {
+            "api_key": self.config.roboflow_api_key or os.getenv("ROBOFLOW_API_KEY"),
+            "confidence": api_confidence,
+            "overlap": int(np.clip(self.config.roboflow_overlap, 0, 100)),
+        }
+        try:
+            response = requests.post(
+                url,
+                params=params,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20,
+            )
+            response.raise_for_status()
+            response_data = response.json()
+        except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            status_text = f" status={status}" if status is not None else ""
+            raise RuntimeError(
+                f"Roboflow request failed for endpoint '{endpoint}'.{status_text}"
+            ) from None
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Roboflow returned a non-JSON response for endpoint '{endpoint}'."
+            ) from None
         predictions = response_data.get("predictions", [])
         if isinstance(predictions, dict) and predictions.get("segmentation_mask"):
             decoded_mask = decode_semantic_segmentation_mask(
@@ -406,9 +435,7 @@ class WaterEdgeSegmenter:
         if self.roboflow_mask_mode == "all":
             return regular, muddy
 
-        _, heuristic_muddy = self._segment_heuristic(roi_frame)
-        if self.config.muddy_loose:
-            heuristic_muddy = cv2.bitwise_or(heuristic_muddy, self._segment_loose_muddy(roi_frame))
+        _, heuristic_muddy = self._segment_heuristic_layers(roi_frame)
         roboflow_mask = cv2.bitwise_or(regular, muddy)
         muddy_candidate = cv2.bitwise_and(roboflow_mask, heuristic_muddy)
         if self.config.muddy_expand_pixels > 0:
@@ -558,15 +585,41 @@ def filter_small_components(mask: np.ndarray, min_area: int, max_component_aspec
     return filtered
 
 
-def contours_from_mask(mask: np.ndarray, min_area: int, epsilon_ratio: float = 0.0025) -> list[np.ndarray]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+def contours_from_mask(
+    mask: np.ndarray,
+    min_area: int,
+    epsilon_ratio: float = 0.0025,
+    curve_iterations: int = 0,
+) -> list[np.ndarray]:
+    chain_mode = cv2.CHAIN_APPROX_NONE if curve_iterations > 0 else cv2.CHAIN_APPROX_SIMPLE
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, chain_mode)
     kept: list[np.ndarray] = []
     for contour in contours:
         if cv2.contourArea(contour) < min_area:
             continue
         epsilon = max(1.0, max(0.0, epsilon_ratio) * cv2.arcLength(contour, True))
-        kept.append(cv2.approxPolyDP(contour, epsilon, True))
+        if epsilon_ratio > 0:
+            contour = cv2.approxPolyDP(contour, epsilon, True)
+        contour = smooth_closed_contour(contour, curve_iterations)
+        if len(contour) >= 3:
+            kept.append(contour)
     return kept
+
+
+def smooth_closed_contour(contour: np.ndarray, iterations: int) -> np.ndarray:
+    if iterations <= 0 or len(contour) < 4:
+        return contour
+    points = contour.reshape(-1, 2).astype(np.float32)
+    for _ in range(max(0, int(iterations))):
+        if len(points) < 4:
+            break
+        next_points = []
+        for index, point in enumerate(points):
+            neighbor = points[(index + 1) % len(points)]
+            next_points.append(point * 0.75 + neighbor * 0.25)
+            next_points.append(point * 0.25 + neighbor * 0.75)
+        points = np.asarray(next_points, dtype=np.float32)
+    return np.round(points).astype(np.int32).reshape(-1, 1, 2)
 
 
 def edge_mask_from_contours(

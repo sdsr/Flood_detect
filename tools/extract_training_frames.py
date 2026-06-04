@@ -14,6 +14,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--end-ms", type=float, default=0.0)
     parser.add_argument("--every-sec", type=float, default=2.0)
     parser.add_argument("--prefix", default="frame")
+    parser.add_argument(
+        "--seek-mode",
+        action="store_true",
+        help="Seek by timestamp instead of stepping through decoded frames. Useful for MP4s with broken FPS metadata.",
+    )
+    parser.add_argument("--max-images", type=int, default=0)
     return parser
 
 
@@ -24,6 +30,12 @@ def main() -> int:
         raise SystemExit(f"failed to open source: {args.source}")
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.seek_mode:
+        saved = extract_by_seek(cap, out_dir, args)
+        cap.release()
+        print(f"saved {saved} frames to {out_dir.resolve()}")
+        return 0
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     pending_frame, pending_ms = read_seek_frame(cap, args.start_ms)
@@ -47,10 +59,31 @@ def main() -> int:
             filename = out_dir / f"{args.prefix}_{saved:05d}_{int(pos_ms):08d}ms.jpg"
             cv2.imwrite(str(filename), frame)
             saved += 1
+            if args.max_images > 0 and saved >= args.max_images:
+                break
         seen += 1
     cap.release()
     print(f"saved {saved} frames to {out_dir.resolve()}")
     return 0
+
+
+def extract_by_seek(cap: cv2.VideoCapture, out_dir: Path, args) -> int:
+    seek_ms = max(0.0, args.start_ms)
+    step_ms = max(1.0, args.every_sec * 1000.0)
+    saved = 0
+    while True:
+        if args.end_ms > 0 and seek_ms > args.end_ms:
+            break
+        frame, pos_ms = read_seek_frame(cap, seek_ms)
+        seek_ms += step_ms
+        if frame is None or pos_ms is None:
+            break
+        filename = out_dir / f"{args.prefix}_{saved:05d}_{int(pos_ms):08d}ms.jpg"
+        cv2.imwrite(str(filename), frame)
+        saved += 1
+        if args.max_images > 0 and saved >= args.max_images:
+            break
+    return saved
 
 
 def parse_source(value: str):

@@ -16,6 +16,7 @@ from src.water_edge_segmenter import (  # noqa: E402
     EdgeConfig,
     WaterEdgeSegmenter,
     contours_from_mask,
+    filter_small_components,
     parse_bgr,
     parse_polygons,
     parse_roi,
@@ -79,6 +80,52 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--water-color", default="255,255,0")
     parser.add_argument("--muddy-color", default="0,170,255")
+    parser.add_argument(
+        "--polygon-mode",
+        choices=("contour", "grid-runs"),
+        default="contour",
+        help=(
+            "contour stores one outer polygon per connected component. "
+            "grid-runs stores small horizontal polygons to preserve holes "
+            "from crosswalks, vehicles, and dark non-water patches."
+        ),
+    )
+    parser.add_argument(
+        "--grid-size",
+        type=int,
+        default=8,
+        help="Pixel size used by --polygon-mode grid-runs.",
+    )
+    parser.add_argument(
+        "--min-run-cells",
+        type=int,
+        default=2,
+        help="Minimum contiguous grid cells for a grid-runs polygon.",
+    )
+    parser.add_argument(
+        "--label-classes",
+        choices=("all", "water-only", "muddy-only", "combined-as-muddy"),
+        default="all",
+        help="Choose which pseudo-label classes to write. combined-as-muddy merges all detected water into class 1.",
+    )
+    parser.add_argument(
+        "--combine-regular-min-muddy-area",
+        type=int,
+        default=0,
+        help=(
+            "For combined-as-muddy, merge reflective regular water only when "
+            "the muddy mask area is at least this many pixels."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-muddy-component-area",
+        type=int,
+        default=0,
+        help=(
+            "When combined-as-muddy falls back to muddy-only, discard muddy "
+            "components smaller than this many pixels. 0 uses --min-area."
+        ),
+    )
     return parser
 
 
@@ -140,8 +187,45 @@ def main() -> int:
 
         masks = segmenter.segment_layers(frame)
         label_lines = []
-        label_lines.extend(mask_to_yolo_lines(masks.regular, class_id=0, min_area=args.min_area))
-        label_lines.extend(mask_to_yolo_lines(masks.muddy, class_id=1, min_area=args.min_area))
+        if args.label_classes == "combined-as-muddy":
+            flood_mask = choose_combined_flood_mask(
+                regular_mask=masks.regular,
+                muddy_mask=masks.muddy,
+                min_muddy_area=args.combine_regular_min_muddy_area,
+                fallback_component_area=args.fallback_muddy_component_area or args.min_area,
+            )
+            label_lines.extend(
+                mask_to_yolo_lines(
+                    flood_mask,
+                    class_id=1,
+                    min_area=args.min_area,
+                    polygon_mode=args.polygon_mode,
+                    grid_size=args.grid_size,
+                    min_run_cells=args.min_run_cells,
+                )
+            )
+        if args.label_classes in {"all", "water-only"}:
+            label_lines.extend(
+                mask_to_yolo_lines(
+                    masks.regular,
+                    class_id=0,
+                    min_area=args.min_area,
+                    polygon_mode=args.polygon_mode,
+                    grid_size=args.grid_size,
+                    min_run_cells=args.min_run_cells,
+                )
+            )
+        if args.label_classes in {"all", "muddy-only"}:
+            label_lines.extend(
+                mask_to_yolo_lines(
+                    masks.muddy,
+                    class_id=1,
+                    min_area=args.min_area,
+                    polygon_mode=args.polygon_mode,
+                    grid_size=args.grid_size,
+                    min_run_cells=args.min_run_cells,
+                )
+            )
         if not label_lines:
             continue
 
@@ -156,6 +240,24 @@ def main() -> int:
     cap.release()
     print(f"saved {saved} pseudo-labeled images under {output_dir.resolve()}")
     return 0
+
+
+def choose_combined_flood_mask(
+    regular_mask,
+    muddy_mask,
+    min_muddy_area: int,
+    fallback_component_area: int,
+):
+    if min_muddy_area <= 0:
+        return cv2.bitwise_or(regular_mask, muddy_mask)
+    muddy_area = int(cv2.countNonZero(muddy_mask))
+    if muddy_area >= min_muddy_area:
+        return cv2.bitwise_or(regular_mask, muddy_mask)
+    return filter_small_components(
+        muddy_mask,
+        min_area=max(1, int(fallback_component_area)),
+        max_component_aspect=0.0,
+    )
 
 
 def clean_dataset_dirs(output_dir: Path) -> None:
@@ -193,7 +295,22 @@ def write_data_yaml(output_dir: Path) -> None:
     )
 
 
-def mask_to_yolo_lines(mask, class_id: int, min_area: int) -> list[str]:
+def mask_to_yolo_lines(
+    mask,
+    class_id: int,
+    min_area: int,
+    polygon_mode: str = "contour",
+    grid_size: int = 8,
+    min_run_cells: int = 2,
+) -> list[str]:
+    if polygon_mode == "grid-runs":
+        return mask_to_grid_run_lines(
+            mask,
+            class_id=class_id,
+            min_area=min_area,
+            grid_size=grid_size,
+            min_run_cells=min_run_cells,
+        )
     height, width = mask.shape[:2]
     lines: list[str] = []
     for contour in contours_from_mask(mask, min_area):
@@ -207,6 +324,54 @@ def mask_to_yolo_lines(mask, class_id: int, min_area: int) -> list[str]:
             normalized.append(f"{max(0.0, min(1.0, x / width)):.6f}")
             normalized.append(f"{max(0.0, min(1.0, y / height)):.6f}")
         if len(normalized) >= 6:
+            lines.append(f"{class_id} " + " ".join(normalized))
+    return lines
+
+
+def mask_to_grid_run_lines(
+    mask,
+    class_id: int,
+    min_area: int,
+    grid_size: int,
+    min_run_cells: int,
+) -> list[str]:
+    height, width = mask.shape[:2]
+    grid_size = max(2, int(grid_size))
+    min_run_cells = max(1, int(min_run_cells))
+    small_width = max(1, (width + grid_size - 1) // grid_size)
+    small_height = max(1, (height + grid_size - 1) // grid_size)
+    small = cv2.resize(mask, (small_width, small_height), interpolation=cv2.INTER_AREA)
+    small = small >= 128
+
+    lines: list[str] = []
+    for y_cell in range(small_height):
+        x_cell = 0
+        while x_cell < small_width:
+            while x_cell < small_width and not small[y_cell, x_cell]:
+                x_cell += 1
+            start = x_cell
+            while x_cell < small_width and small[y_cell, x_cell]:
+                x_cell += 1
+            end = x_cell
+            run_cells = end - start
+            if run_cells < min_run_cells:
+                continue
+            x0 = start * grid_size
+            x1 = min(width, end * grid_size)
+            y0 = y_cell * grid_size
+            y1 = min(height, (y_cell + 1) * grid_size)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            points = (
+                (x0, y0),
+                (x1, y0),
+                (x1, y1),
+                (x0, y1),
+            )
+            normalized = []
+            for x, y in points:
+                normalized.append(f"{max(0.0, min(1.0, x / width)):.6f}")
+                normalized.append(f"{max(0.0, min(1.0, y / height)):.6f}")
             lines.append(f"{class_id} " + " ".join(normalized))
     return lines
 
