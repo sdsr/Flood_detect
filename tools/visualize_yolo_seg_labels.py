@@ -125,6 +125,19 @@ def discover_pairs(dataset_dir: Path, split: str) -> list[tuple[Path, Path]]:
             label_path = label_dir / f"{image_path.stem}.txt"
             if label_path.exists():
                 pairs.append((image_path, label_path))
+    if pairs or split != "all":
+        return pairs
+
+    image_dir = dataset_dir / "images"
+    label_dir = dataset_dir / "labels"
+    if not image_dir.exists() or not label_dir.exists():
+        return pairs
+    for image_path in sorted(image_dir.iterdir()):
+        if image_path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        label_path = label_dir / f"{image_path.stem}.txt"
+        if label_path.exists():
+            pairs.append((image_path, label_path))
     return pairs
 
 

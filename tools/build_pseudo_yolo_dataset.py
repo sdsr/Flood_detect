@@ -70,7 +70,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--surface-preset",
         default="none",
-        choices=("none", "yeongildae", "yeongildae-road"),
+        choices=(
+            "none",
+            "yeongildae",
+            "yeongildae-road",
+            "yeongildae-road-strict",
+            "hakpa-harbor-road",
+        ),
         help="Valid-surface mask for fixed CCTV samples.",
     )
     parser.add_argument(

@@ -29,6 +29,8 @@ class EdgeConfig:
     edge_smooth_ratio: float = 0.0025
     edge_curve_iterations: int = 0
     edge_bridge_pixels: int = 0
+    edge_keep_largest: int = 0
+    edge_fill_holes: bool = False
     process_scale: float = 1.0
     suppress_roi_border_edges: bool = True
     min_area: int = 800
@@ -202,7 +204,7 @@ class WaterEdgeSegmenter:
     def draw(self, frame: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
         masks = self.segment_layers(frame)
         mask = masks.combined
-        edge_mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
+        edge_mask = prepare_edge_mask(mask, self.config)
         contours = contours_from_mask(
             edge_mask,
             self.config.min_area,
@@ -242,7 +244,7 @@ class WaterEdgeSegmenter:
         mask: np.ndarray,
         color: ColorBGR,
     ) -> None:
-        mask = bridge_mask_gaps(mask, self.config.edge_bridge_pixels)
+        mask = prepare_edge_mask(mask, self.config)
         contours = contours_from_mask(
             mask,
             self.config.min_area,
@@ -649,6 +651,47 @@ def bridge_mask_gaps(mask: np.ndarray, pixels: int) -> np.ndarray:
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
 
+def prepare_edge_mask(mask: np.ndarray, config: EdgeConfig) -> np.ndarray:
+    edge_mask = bridge_mask_gaps(mask, config.edge_bridge_pixels)
+    if config.edge_fill_holes:
+        edge_mask = fill_mask_holes(edge_mask)
+    if config.edge_keep_largest > 0:
+        edge_mask = keep_largest_components(
+            edge_mask,
+            count=config.edge_keep_largest,
+            min_area=config.min_area,
+        )
+    return edge_mask
+
+
+def fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    if mask.size == 0:
+        return mask
+    flood = mask.copy()
+    height, width = flood.shape[:2]
+    flood_mask = np.zeros((height + 2, width + 2), dtype=np.uint8)
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_or(mask, holes)
+
+
+def keep_largest_components(mask: np.ndarray, count: int, min_area: int) -> np.ndarray:
+    if count <= 0:
+        return mask
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    components = []
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area >= min_area:
+            components.append((area, label))
+    if not components:
+        return np.zeros_like(mask)
+    kept = np.zeros_like(mask)
+    for _, label in sorted(components, reverse=True)[:count]:
+        kept[labels == label] = 255
+    return kept
+
+
 def expand_mask_within(seed: np.ndarray, constraint: np.ndarray, pixels: int) -> np.ndarray:
     result = cv2.bitwise_and(seed, constraint)
     if pixels <= 0:
@@ -730,8 +773,48 @@ def surface_preset_polygons(name: Optional[str]) -> Optional[tuple[Polygon, ...]
     if name is None or name.strip().lower() in {"", "none"}:
         return None
     normalized = name.strip().lower()
-    if normalized not in {"yeongildae", "yeongildae-road"}:
-        raise ValueError("surface preset must be 'none', 'yeongildae', or 'yeongildae-road'")
+    if normalized not in {
+        "yeongildae",
+        "yeongildae-road",
+        "yeongildae-road-strict",
+        "hakpa-harbor-road",
+    }:
+        raise ValueError(
+            "surface preset must be 'none', 'yeongildae', 'yeongildae-road', "
+            "'yeongildae-road-strict', or 'hakpa-harbor-road'"
+        )
+    if normalized == "hakpa-harbor-road":
+        return (
+            (
+                (0.20, 0.23),
+                (0.43, 0.20),
+                (0.58, 0.29),
+                (0.73, 0.43),
+                (0.92, 0.61),
+                (1.00, 0.72),
+                (1.00, 1.00),
+                (0.12, 1.00),
+                (0.18, 0.65),
+                (0.20, 0.43),
+            ),
+        )
+    if normalized == "yeongildae-road-strict":
+        return (
+            (
+                (0.00, 0.62),
+                (0.10, 0.60),
+                (0.20, 0.58),
+                (0.33, 0.56),
+                (0.46, 0.52),
+                (0.55, 0.44),
+                (0.61, 0.34),
+                (0.67, 0.27),
+                (0.78, 0.22),
+                (1.00, 0.18),
+                (1.00, 1.00),
+                (0.00, 1.00),
+            ),
+        )
     if normalized == "yeongildae-road":
         return (
             (

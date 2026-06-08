@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 import cv2
+import numpy as np
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -26,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", default="datasets/yeongildae_manual_5s")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--log-file", default=None, help="Optional file for background server logs.")
     return parser
 
 
@@ -132,6 +135,10 @@ class LabelStore:
 
     def write_labels(self, index: int, labels: list[dict]) -> dict:
         image_path = self.get_image(index)
+        self.write_labels_for_image(image_path, labels)
+        return self.read_labels(index)
+
+    def write_labels_for_image(self, image_path: Path, labels: list[dict]) -> None:
         label_path = self.label_path_for(image_path)
         lines = []
         for label in labels:
@@ -157,7 +164,53 @@ class LabelStore:
             flattened = " ".join(f"{value:.6f}" for point in cleaned for value in point)
             lines.append(f"{class_id} {flattened}")
         label_path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
-        return self.read_labels(index)
+
+    def refine_label(self, index: int, label: dict, mode: str = "color") -> dict:
+        image_path = self.get_image(index)
+        frame = cv2.imread(str(image_path))
+        if frame is None:
+            raise ValueError(f"failed to read image: {image_path}")
+        class_id = int(label.get("class_id", 1))
+        width, height = self.image_shape(image_path)
+        points = normalized_points_to_pixels(label.get("points") or [], width, height)
+        refined = refine_rough_polygon(frame, class_id, points, mode)
+        return {
+            "labels": refined,
+            "mode": mode,
+        }
+
+    def propagate_labels(
+        self,
+        index: int,
+        labels: list[dict],
+        radius: int,
+        direction: str,
+        overwrite: bool,
+    ) -> dict:
+        center = self.clamp_index(index)
+        radius = max(1, min(120, int(radius)))
+        if direction == "next":
+            targets = range(center, min(len(self.images), center + radius + 1))
+        elif direction == "prev":
+            targets = range(max(0, center - radius), center + 1)
+        else:
+            targets = range(max(0, center - radius), min(len(self.images), center + radius + 1))
+
+        changed = 0
+        skipped = 0
+        for target in targets:
+            image_path = self.get_image(target)
+            label_path = self.label_path_for(image_path)
+            has_label = label_path.exists() and bool(label_path.read_text(encoding="utf-8").strip())
+            if target != center and has_label and not overwrite:
+                skipped += 1
+                continue
+            self.write_labels_for_image(image_path, labels)
+            changed += 1
+        stats = self.stats()
+        stats["changed"] = changed
+        stats["skipped"] = skipped
+        return stats
 
     def labeled_count(self) -> int:
         count = 0
@@ -220,14 +273,33 @@ def make_handler(store: LabelStore):
         def do_POST(self) -> None:
             parsed = urlparse(self.path)
             query = parse_qs(parsed.query)
-            if parsed.path != "/api/labels":
+            if parsed.path not in {"/api/labels", "/api/refine", "/api/propagate"}:
                 self.send_error(404, "not found")
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 body = self.rfile.read(length).decode("utf-8")
                 payload = json.loads(body or "{}")
-                self.send_json(store.write_labels(parse_index(query), payload.get("labels") or []))
+                if parsed.path == "/api/labels":
+                    self.send_json(store.write_labels(parse_index(query), payload.get("labels") or []))
+                elif parsed.path == "/api/refine":
+                    self.send_json(
+                        store.refine_label(
+                            parse_index(query),
+                            payload.get("label") or {},
+                            str(payload.get("mode") or "color"),
+                        )
+                    )
+                else:
+                    self.send_json(
+                        store.propagate_labels(
+                            parse_index(query),
+                            payload.get("labels") or [],
+                            int(payload.get("radius") or 6),
+                            str(payload.get("direction") or "both"),
+                            bool(payload.get("overwrite", True)),
+                        )
+                    )
             except Exception as exc:  # noqa: BLE001
                 self.send_error(500, str(exc))
 
@@ -264,6 +336,129 @@ def parse_index(query: dict[str, list[str]]) -> int:
         return int(query.get("index", ["0"])[0])
     except ValueError:
         return 0
+
+
+def normalized_points_to_pixels(points: list, width: int, height: int) -> np.ndarray:
+    pixel_points = []
+    for point in points:
+        if not isinstance(point, list | tuple) or len(point) != 2:
+            continue
+        try:
+            x = max(0.0, min(1.0, float(point[0])))
+            y = max(0.0, min(1.0, float(point[1])))
+        except (TypeError, ValueError):
+            continue
+        pixel_points.append((int(round(x * (width - 1))), int(round(y * (height - 1)))))
+    return np.asarray(pixel_points, dtype=np.int32)
+
+
+def refine_rough_polygon(
+    frame: np.ndarray,
+    class_id: int,
+    points: np.ndarray,
+    mode: str,
+) -> list[dict]:
+    if len(points) < 3:
+        return []
+
+    height, width = frame.shape[:2]
+    rough_mask = np.zeros((height, width), dtype=np.uint8)
+    cv2.fillPoly(rough_mask, [points.reshape(-1, 1, 2)], 255)
+    mode = mode.lower().strip()
+    if mode == "color":
+        refined_mask = color_refined_mask(frame, rough_mask, class_id)
+        rough_area = max(1, cv2.countNonZero(rough_mask))
+        refined_area = cv2.countNonZero(refined_mask)
+        if refined_area < rough_area * 0.08:
+            refined_mask = rough_mask
+    else:
+        refined_mask = rough_mask
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    refined_mask = cv2.morphologyEx(refined_mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(refined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+
+    labels = []
+    min_area = max(300, int(cv2.countNonZero(rough_mask) * 0.02))
+    for contour in contours[:5]:
+        if cv2.contourArea(contour) < min_area:
+            continue
+        epsilon = max(2.0, 0.0025 * cv2.arcLength(contour, True))
+        contour = cv2.approxPolyDP(contour, epsilon, True)
+        contour = smooth_contour(contour, iterations=1)
+        normalized = []
+        for x, y in contour.reshape(-1, 2):
+            normalized.append([float(np.clip(x / width, 0.0, 1.0)), float(np.clip(y / height, 0.0, 1.0))])
+        if len(normalized) >= 3:
+            labels.append({"class_id": class_id, "points": normalized})
+    if labels:
+        return labels
+    return [{"class_id": class_id, "points": pixel_points_to_normalized(points, width, height)}]
+
+
+def color_refined_mask(frame: np.ndarray, rough_mask: np.ndarray, class_id: int) -> np.ndarray:
+    blurred = cv2.bilateralFilter(frame, 7, 45, 45)
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
+    gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
+    gray_f = gray.astype(np.float32)
+    mean = cv2.blur(gray_f, (13, 13))
+    mean_sq = cv2.blur(gray_f * gray_f, (13, 13))
+    local_std = np.sqrt(np.maximum(mean_sq - mean * mean, 0))
+
+    hue = hsv[:, :, 0]
+    saturation = hsv[:, :, 1]
+    value = hsv[:, :, 2]
+    lab_a = lab[:, :, 1]
+    lab_b = lab[:, :, 2]
+
+    reflective = (saturation <= 90) & (value >= 95) & (value <= 248) & (local_std <= 48)
+    warm_smooth = (
+        (hue >= 5)
+        & (hue <= 58)
+        & (saturation >= 8)
+        & (saturation <= 225)
+        & (value >= 40)
+        & (value <= 245)
+        & (local_std <= 55)
+        & (lab_b >= 120)
+    )
+    brown_smooth = (
+        (lab_b >= 126)
+        & (lab_a >= 104)
+        & (lab_a <= 165)
+        & (value >= 35)
+        & (value <= 245)
+        & (local_std <= 58)
+    )
+    if class_id == 0:
+        candidate = reflective
+    else:
+        candidate = reflective | warm_smooth | brown_smooth
+    return cv2.bitwise_and(candidate.astype(np.uint8) * 255, rough_mask)
+
+
+def smooth_contour(contour: np.ndarray, iterations: int) -> np.ndarray:
+    if iterations <= 0 or len(contour) < 4:
+        return contour
+    points = contour.reshape(-1, 2).astype(np.float32)
+    for _ in range(iterations):
+        next_points = []
+        for index, point in enumerate(points):
+            neighbor = points[(index + 1) % len(points)]
+            next_points.append(point * 0.75 + neighbor * 0.25)
+            next_points.append(point * 0.25 + neighbor * 0.75)
+        points = np.asarray(next_points, dtype=np.float32)
+    return np.round(points).astype(np.int32).reshape(-1, 1, 2)
+
+
+def pixel_points_to_normalized(points: np.ndarray, width: int, height: int) -> list[list[float]]:
+    return [
+        [float(np.clip(x / width, 0.0, 1.0)), float(np.clip(y / height, 0.0, 1.0))]
+        for x, y in points.reshape(-1, 2)
+    ]
 
 
 HTML_PAGE = r"""<!doctype html>
@@ -418,6 +613,15 @@ input[type="range"] { width: 100%; }
         <div class="row">
           <button id="copyPrevBtn">Copy previous</button>
           <button id="emptySaveBtn">Save empty</button>
+        </div>
+        <div class="row">
+          <button id="refineBtn" class="primary">Auto refine rough</button>
+          <button id="smoothBtn">Smooth all</button>
+        </div>
+        <div class="row">
+          <input id="propRadius" type="number" min="1" max="120" value="6" title="Frames to propagate" />
+          <button id="propNextBtn">Copy next</button>
+          <button id="propBothBtn">Copy ±</button>
         </div>
       </div>
       <div id="polyList" class="list"></div>
@@ -590,6 +794,55 @@ async function copyPrevious() {
   draw();
 }
 
+async function refineCurrent(mode="color") {
+  if (current.length < 3) {
+    statusEl.textContent = "Draw a rough polygon first";
+    return;
+  }
+  const res = await fetch(`/api/refine?index=${index}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({label: {class_id: currentClass, points: current}, mode}),
+  });
+  const data = await res.json();
+  labels.push(...(data.labels || []));
+  current = [];
+  dirty = true;
+  updateList();
+  draw();
+}
+
+async function smoothAll() {
+  if (!labels.length) return;
+  const nextLabels = [];
+  for (const label of labels) {
+    const res = await fetch(`/api/refine?index=${index}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({label, mode: "smooth"}),
+    });
+    const data = await res.json();
+    nextLabels.push(...(data.labels || []));
+  }
+  labels = nextLabels;
+  dirty = true;
+  updateList();
+  draw();
+}
+
+async function propagate(direction) {
+  if (dirty) await saveLabels(false);
+  const radius = Math.max(1, Math.min(120, Number(document.getElementById("propRadius").value || 6)));
+  const res = await fetch(`/api/propagate?index=${index}`, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({labels, radius, direction, overwrite: true}),
+  });
+  const data = await res.json();
+  statsEl.textContent = `copied ${data.changed} frames | labeled ${data.labeled_images}/${data.images}`;
+  await loadStats();
+}
+
 canvas.addEventListener("click", evt => {
   current.push(canvasPoint(evt));
   dirty = true;
@@ -607,6 +860,10 @@ document.getElementById("cancelBtn").onclick = () => { current = []; draw(); };
 document.getElementById("clearBtn").onclick = () => { labels = []; current = []; dirty = true; updateList(); draw(); };
 document.getElementById("copyPrevBtn").onclick = copyPrevious;
 document.getElementById("emptySaveBtn").onclick = () => saveLabels(true);
+document.getElementById("refineBtn").onclick = () => refineCurrent("color");
+document.getElementById("smoothBtn").onclick = smoothAll;
+document.getElementById("propNextBtn").onclick = () => propagate("next");
+document.getElementById("propBothBtn").onclick = () => propagate("both");
 document.getElementById("saveBtn").onclick = () => saveLabels(false);
 document.getElementById("prevBtn").onclick = () => loadFrame(index - 1);
 document.getElementById("nextBtn").onclick = () => loadFrame(index + 1);
@@ -633,19 +890,36 @@ loadFrame(index);
 
 def main() -> int:
     args = build_parser().parse_args()
-    store = LabelStore(Path(args.dataset))
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(store))
+    log_path = Path(args.log_file) if args.log_file else None
+    try:
+        store = LabelStore(Path(args.dataset))
+        server = ThreadingHTTPServer((args.host, args.port), make_handler(store))
+    except Exception as exc:  # noqa: BLE001
+        write_log(log_path, f"startup failed: {exc}\n{traceback.format_exc()}")
+        raise
+
     url = f"http://{args.host}:{args.port}"
-    print(f"labeler running: {url}")
-    print(f"dataset: {store.dataset_dir.resolve()}")
-    print("press Ctrl+C to stop")
+    message = f"labeler running: {url}\ndataset: {store.dataset_dir.resolve()}\npress Ctrl+C to stop"
+    print(message)
+    write_log(log_path, message)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        write_log(log_path, "stopped by KeyboardInterrupt")
+    except Exception as exc:  # noqa: BLE001
+        write_log(log_path, f"server failed: {exc}\n{traceback.format_exc()}")
+        raise
     finally:
         server.server_close()
     return 0
+
+
+def write_log(log_path: Path | None, message: str) -> None:
+    if log_path is None:
+        return
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as file:
+        file.write(message.rstrip() + "\n")
 
 
 if __name__ == "__main__":

@@ -86,6 +86,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Close small mask gaps before drawing edge lines, without changing the model output.",
     )
     parser.add_argument(
+        "--edge-keep-largest",
+        type=int,
+        default=0,
+        help="Draw only the N largest connected edge components after gap closing; 0 keeps all.",
+    )
+    parser.add_argument(
+        "--edge-fill-holes",
+        action="store_true",
+        help="Fill enclosed holes in the edge mask before drawing contours.",
+    )
+    parser.add_argument(
         "--process-scale",
         type=float,
         default=1.0,
@@ -141,8 +152,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--surface-preset",
         default="none",
-        choices=("none", "yeongildae", "yeongildae-road"),
-        help="Valid-surface mask. Use yeongildae-road when storefront/building areas are included.",
+        choices=(
+            "none",
+            "yeongildae",
+            "yeongildae-road",
+            "yeongildae-road-strict",
+            "hakpa-harbor-road",
+        ),
+        help=(
+            "Valid-surface mask. Use camera-specific road presets to exclude "
+            "sidewalk/building false positives."
+        ),
     )
     parser.add_argument(
         "--surface-polygon",
@@ -188,6 +208,8 @@ def main() -> int:
             edge_smooth_ratio=max(0.0, args.edge_smooth_ratio),
             edge_curve_iterations=max(0, args.edge_curve_iterations),
             edge_bridge_pixels=max(0, args.edge_bridge_pixels),
+            edge_keep_largest=max(0, args.edge_keep_largest),
+            edge_fill_holes=args.edge_fill_holes,
             process_scale=max(0.1, min(1.0, args.process_scale)),
             suppress_roi_border_edges=not args.show_roi_border_edges,
             min_area=args.min_area,
@@ -399,9 +421,18 @@ def read_seek_frame(cap: cv2.VideoCapture, start_ms: float):
             cap.set(cv2.CAP_PROP_POS_MSEC, pos_ms)
         ok, frame = cap.read()
         if ok:
+            actual_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
             if pos_ms != start_ms:
                 print(f"first readable frame: {pos_ms:.0f}ms")
-            return frame, pos_ms
+            if start_ms > 0 and actual_ms > 0 and abs(actual_ms - start_ms) > 2000:
+                print(
+                    "WARNING: OpenCV seek landed far from the requested timestamp "
+                    f"(requested={format_ms(start_ms)}, actual={format_ms(actual_ms)}). "
+                    "If this happens on slider/A-D/Z-X seeks, remux the video with "
+                    "tools/remux_seekable_video.py and use the remuxed file.",
+                    file=sys.stderr,
+                )
+            return frame, actual_ms if actual_ms > 0 else pos_ms
     return None, None
 
 
